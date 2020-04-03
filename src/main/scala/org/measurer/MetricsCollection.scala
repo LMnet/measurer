@@ -12,10 +12,27 @@ trait CustomMetric extends Metric {
 class MetricsRegistry {
 
   private val metricsMap: TrieMap[MetricIdentifier, Metric] = TrieMap.empty
+  private val registriesMap: TrieMap[MetricIdentifier, MetricsRegistry] = TrieMap.empty
 
-  def registeredMetrics: scala.collection.Map[MetricIdentifier, Metric] = metricsMap.readOnlySnapshot()
+  def registeredMetrics: scala.collection.Map[MetricIdentifier, Metric] = {
+    val topLevelMetrics = metricsMap.readOnlySnapshot()
+    val children = registriesMap.readOnlySnapshot()
+    val childrenMetrics = children.flatMap { case (registryId, registry) => // TODO: id collisions
+      val metrics = registry.registeredMetrics
+      if (registryId.name != "" || registryId.labels.nonEmpty) {
+        val prefix = if (registryId.name != "") s"${registryId.name}-" else ""
+        metrics.map { case (id, metric) =>
+          id.copy(
+            name = prefix + id.name,
+            labels = id.labels ++ registryId.labels, // TODO: labels collision
+          ) -> metric
+        }
+      } else metrics
+    }
+    topLevelMetrics ++ childrenMetrics
+  }
 
-  protected def register[M <: Metric](name: String, labels: Map[String, String], metric: M): M = {
+  def register[M <: Metric](name: String, labels: Map[String, String], metric: M): M = {
     val id = MetricIdentifier(name, labels)
     metricsMap.putIfAbsent(id, metric) match {
       case Some(oldMetric) => throw MetricAlreadyDefinedException(id, oldMetric)
@@ -23,19 +40,19 @@ class MetricsRegistry {
     }
   }
 
-  protected def register[M <: Metric](labels: Map[String, String], metric: M)(implicit name: sourcecode.Name): M = {
+  def register[M <: Metric](labels: Map[String, String], metric: M)(implicit name: sourcecode.Name): M = {
     register(name.value, labels, metric)
   }
 
-  protected def register[M <: Metric](name: String, metric: M): M = {
+  def register[M <: Metric](name: String, metric: M): M = {
     register(name, Map.empty, metric)
   }
 
-  protected def register[M <: Metric](metric: M)(implicit name: sourcecode.Name): M = {
+  def register[M <: Metric](metric: M)(implicit name: sourcecode.Name): M = {
     register(name.value, metric)
   }
 
-  protected def registerOrGet[M <: Metric](
+  def registerOrGet[M <: Metric](
     name: String,
     labels: Map[String, String],
     metric: M
@@ -55,28 +72,38 @@ class MetricsRegistry {
   }
 
 
-  protected def counter(name: String, labels: Map[String, String]): Counter = {
+  def registerRegistry[M <: MetricsRegistry](name: String, labels: Map[String, String], registry: M): M = {
+    val id = MetricIdentifier(name, labels)
+    registriesMap.putIfAbsent(id, registry) match {
+      case Some(oldRegistry) => throw RegistryAlreadyDefinedException(id, oldRegistry)
+      case None => registry
+    }
+  }
+
+
+  def counter(name: String, labels: Map[String, String]): Counter = {
     register(name, labels, Counter())
   }
 
-  protected def counter(labels: Map[String, String])(implicit name: sourcecode.Name): Counter = {
+  def counter(labels: Map[String, String])(implicit name: sourcecode.Name): Counter = {
     counter(name.value, labels)
   }
 
-  protected def counter(name: String): Counter = {
+  def counter(name: String): Counter = {
     counter(name, Map.empty)
   }
 
-  protected def counter()(implicit name: sourcecode.Name): Counter = {
+  def counter()(implicit name: sourcecode.Name): Counter = {
     counter(name.value, Map.empty)
   }
-
-
 }
 
 final case class MetricIdentifier(name: String, labels: Map[String, String])
 
 case class MetricAlreadyDefinedException[M <: Metric](identifier: MetricIdentifier, metric: M)
+  extends RuntimeException // TODO: message
+
+case class RegistryAlreadyDefinedException[M <: MetricsRegistry](identifier: MetricIdentifier, registry: M)
   extends RuntimeException // TODO: message
 
 case class InvalidMetricType[M <: Metric](identifier: MetricIdentifier, actualMetric: Metric, expectedMetric: M)
@@ -106,7 +133,13 @@ class ModuleMetrics extends MetricsRegistry {
 }
 
 object TestApp extends App {
-  val moduleMetrics = new ModuleMetrics
+  val submoduleMetrics = new MetricsRegistry {
+    val foo = counter("bar")
+  }
+
+  val moduleMetrics = new ModuleMetrics {
+    val fooSubmodule = registerRegistry("foo", Map("submodule" -> "foo"), submoduleMetrics)
+  }
 
   moduleMetrics.published(MsgType.Foo)
 
